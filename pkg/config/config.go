@@ -508,6 +508,16 @@ type MaixCamSettings struct {
 	Port int    `json:"port" yaml:"-" env:"PICOCLAW_CHANNELS_MAIXCAM_PORT"`
 }
 
+// HTTPAPISettings configures the OpenClaw-compatible HTTP REST channel.
+// It exposes /agent, /agent.wait, /v1/chat/completions, and /v1/models
+// so that temporal-agent-worker and LibreChat can invoke agents over plain HTTP.
+type HTTPAPISettings struct {
+	Host           string       `json:"host"            yaml:"-" env:"PICOCLAW_CHANNELS_HTTP_API_HOST"`
+	Port           int          `json:"port"            yaml:"-" env:"PICOCLAW_CHANNELS_HTTP_API_PORT"`
+	Token          SecureString `json:"token,omitzero"  yaml:"token,omitempty" env:"PICOCLAW_CHANNELS_HTTP_API_TOKEN"`
+	MaxConnections int          `json:"max_connections" yaml:"-" env:"PICOCLAW_CHANNELS_HTTP_API_MAX_CONNECTIONS"`
+}
+
 type QQSettings struct {
 	AppID                string       `json:"app_id"                   yaml:"-"                    env:"PICOCLAW_CHANNELS_QQ_APP_ID"`
 	AppSecret            SecureString `json:"app_secret,omitzero"      yaml:"app_secret,omitempty" env:"PICOCLAW_CHANNELS_QQ_APP_SECRET"`
