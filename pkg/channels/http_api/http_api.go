@@ -1,10 +1,14 @@
 package http_api
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
+	"os"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -37,9 +41,10 @@ const (
 //	GET  /health
 type HTTPAPIChannel struct {
 	*channels.BaseChannel
-	cfg    *config.HTTPAPISettings
-	bus    *bus.MessageBus
-	server *http.Server
+	cfg        *config.HTTPAPISettings
+	bus        *bus.MessageBus
+	server     *http.Server
+	modelNames []string
 	// pending maps runId → *pendingRequest for in-flight sessions.
 	pending sync.Map
 	ctx     context.Context
@@ -125,9 +130,28 @@ type chatMessage struct {
 	Content string `json:"content"`
 }
 
+type sseDelta struct {
+	Role    string `json:"role,omitempty"`
+	Content string `json:"content,omitempty"`
+}
+
+type sseChoice struct {
+	Index        int      `json:"index"`
+	Delta        sseDelta `json:"delta"`
+	FinishReason *string  `json:"finish_reason"`
+}
+
+type sseChunk struct {
+	ID      string      `json:"id"`
+	Object  string      `json:"object"`
+	Model   string      `json:"model"`
+	Choices []sseChoice `json:"choices"`
+}
+
 type chatCompletionRequest struct {
 	Model    string        `json:"model"`
 	Messages []chatMessage `json:"messages"`
+	Stream   bool          `json:"stream"`
 }
 
 type chatCompletionResponse struct {
@@ -149,6 +173,7 @@ func NewHTTPAPIChannel(
 	bc *config.Channel,
 	cfg *config.HTTPAPISettings,
 	b *bus.MessageBus,
+	modelNames []string,
 ) (*HTTPAPIChannel, error) {
 	port := cfg.Port
 	if port == 0 {
@@ -167,8 +192,9 @@ func NewHTTPAPIChannel(
 			bc.AllowFrom,
 			channels.WithReasoningChannelID(bc.ReasoningChannelID),
 		),
-		cfg: cfg,
-		bus: b,
+		cfg:        cfg,
+		bus:        b,
+		modelNames: modelNames,
 	}
 
 	mux := http.NewServeMux()
@@ -353,74 +379,104 @@ func (c *HTTPAPIChannel) handleAgentCancel(w http.ResponseWriter, r *http.Reques
 	writeJSON(w, http.StatusOK, map[string]string{"status": "cancelled"})
 }
 
-// POST /v1/chat/completions — OpenAI-compatible single-turn endpoint for LibreChat.
-// Extracts the last user message and blocks until the agent responds.
+// POST /v1/chat/completions — OpenAI-compatible endpoint for LibreChat.
+// Checks OPA model access, then proxies the full request to LiteLLM verbatim.
+// The model field from the request is used as-is so LibreChat model selection works.
+// Streaming responses are forwarded transparently (SSE pass-through).
 func (c *HTTPAPIChannel) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
-	var req chatCompletionRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	bodyBytes, err := io.ReadAll(r.Body)
+	if err != nil {
 		http.Error(w, "bad request", http.StatusBadRequest)
 		return
 	}
 
-	var prompt string
-	for i := len(req.Messages) - 1; i >= 0; i-- {
-		if req.Messages[i].Role == "user" {
-			prompt = req.Messages[i].Content
-			break
-		}
-	}
-	if prompt == "" {
-		http.Error(w, "no user message found", http.StatusBadRequest)
+	var req chatCompletionRequest
+	if err := json.Unmarshal(bodyBytes, &req); err != nil {
+		http.Error(w, "bad request", http.StatusBadRequest)
 		return
 	}
 
-	rid := uuid.New().String()
-	pr := newPendingRequest("chat")
-	c.pending.Store(rid, pr)
-	defer c.pending.Delete(rid)
+	model := req.Model
+	if model == "" {
+		model = "qwen3-thinking"
+	}
 
-	if err := c.publish(r.Context(), rid, prompt, nil); err != nil {
-		pr.close()
-		http.Error(w, "failed to dispatch", http.StatusInternalServerError)
+	// OPA model-access check (skipped when OpaURL is not configured).
+	if opaURL := strings.TrimRight(c.cfg.OpaURL, "/"); opaURL != "" {
+		roles := rolesFromHeader(r)
+		allowed, reason := checkModelAccess(r.Context(), opaURL, model, roles)
+		if !allowed {
+			writeJSON(w, http.StatusForbidden, map[string]string{
+				"error":  "model access denied",
+				"reason": reason,
+			})
+			return
+		}
+	}
+
+	// Proxy to LiteLLM — forward the request body unmodified so the model name,
+	// messages, stream flag, and any extra parameters reach LiteLLM unchanged.
+	src := strings.TrimRight(c.cfg.ModelsSourceURL, "/")
+	if src == "" {
+		http.Error(w, "no LiteLLM backend configured", http.StatusServiceUnavailable)
 		return
 	}
 
-	waitCtx, cancel := context.WithTimeout(r.Context(), maxWaitTimeout)
-	defer cancel()
-
-	select {
-	case <-pr.done:
-		pr.mu.Lock()
-		output := pr.content
-		pr.mu.Unlock()
-
-		model := req.Model
-		if model == "" {
-			model = "default"
-		}
-		writeJSON(w, http.StatusOK, chatCompletionResponse{
-			ID:     "chatcmpl-" + rid,
-			Object: "chat.completion",
-			Model:  model,
-			Choices: []chatChoice{{
-				Index:   0,
-				Message: chatMessage{Role: "assistant", Content: output},
-				Reason:  "stop",
-			}},
-		})
-
-	case <-waitCtx.Done():
-		http.Error(w, "request timed out", http.StatusGatewayTimeout)
+	proxyReq, err := http.NewRequestWithContext(r.Context(), http.MethodPost,
+		src+"/v1/chat/completions", bytes.NewReader(bodyBytes))
+	if err != nil {
+		http.Error(w, "failed to build proxy request", http.StatusInternalServerError)
+		return
 	}
+	proxyReq.Header.Set("Content-Type", "application/json")
+	if key := os.Getenv("LITELLM_MASTER_KEY"); key != "" {
+		proxyReq.Header.Set("Authorization", "Bearer "+key)
+	}
+
+	resp, err := http.DefaultClient.Do(proxyReq)
+	if err != nil {
+		http.Error(w, "LiteLLM request failed: "+err.Error(), http.StatusBadGateway)
+		return
+	}
+	defer resp.Body.Close()
+
+	for k, vs := range resp.Header {
+		for _, v := range vs {
+			w.Header().Add(k, v)
+		}
+	}
+	w.WriteHeader(resp.StatusCode)
+	_, _ = io.Copy(w, resp.Body)
 }
 
-// GET /v1/models
+// GET /v1/models — proxies ModelsSourceURL (e.g. litellm) when configured,
+// falling back to the static model list from config.
 func (c *HTTPAPIChannel) handleModels(w http.ResponseWriter, r *http.Request) {
+	if src := strings.TrimRight(c.cfg.ModelsSourceURL, "/"); src != "" {
+		req, err := http.NewRequestWithContext(r.Context(), http.MethodGet, src+"/v1/models", nil)
+		if err == nil {
+			if key := os.Getenv("LITELLM_MASTER_KEY"); key != "" {
+				req.Header.Set("Authorization", "Bearer "+key)
+			}
+			if resp, err := http.DefaultClient.Do(req); err == nil {
+				defer resp.Body.Close()
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(resp.StatusCode)
+				_, _ = io.Copy(w, resp.Body)
+				return
+			}
+		}
+		logger.WarnCF("http_api", "models proxy failed, falling back to config list",
+			map[string]any{"url": src, "error": err})
+	}
+
+	data := make([]map[string]string, 0, len(c.modelNames))
+	for _, name := range c.modelNames {
+		data = append(data, map[string]string{"id": name, "object": "model"})
+	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"object": "list",
-		"data": []map[string]string{
-			{"id": "default", "object": "model"},
-		},
+		"data":   data,
 	})
 }
 
@@ -457,8 +513,102 @@ func (c *HTTPAPIChannel) publish(ctx context.Context, chatID, content string, me
 	})
 }
 
+// writeSSE emits an OpenAI-compatible SSE stream: role chunk → content chunk → [DONE].
+// LangChain.js and LibreChat both require streaming format when stream:true is sent.
+func writeSSE(w http.ResponseWriter, id, model, content string) {
+	flusher, ok := w.(http.Flusher)
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+	w.WriteHeader(http.StatusOK)
+
+	emit := func(delta sseDelta, finish *string) {
+		chunk := sseChunk{
+			ID:     "chatcmpl-" + id,
+			Object: "chat.completion.chunk",
+			Model:  model,
+			Choices: []sseChoice{{
+				Index:        0,
+				Delta:        delta,
+				FinishReason: finish,
+			}},
+		}
+		data, _ := json.Marshal(chunk)
+		fmt.Fprintf(w, "data: %s\n\n", data)
+		if ok {
+			flusher.Flush()
+		}
+	}
+
+	stopReason := "stop"
+	emit(sseDelta{Role: "assistant", Content: ""}, nil)
+	emit(sseDelta{Content: content}, nil)
+	emit(sseDelta{}, &stopReason)
+	fmt.Fprintf(w, "data: [DONE]\n\n")
+	if ok {
+		flusher.Flush()
+	}
+}
+
 func writeJSON(w http.ResponseWriter, status int, v any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(v)
+}
+
+// rolesFromHeader reads caller roles from X-User-Roles (comma-separated).
+// Falls back to ["developer"] so unrestricted models stay accessible without a header.
+func rolesFromHeader(r *http.Request) []string {
+	raw := strings.TrimSpace(r.Header.Get("X-User-Roles"))
+	if raw == "" {
+		return []string{"developer"}
+	}
+	parts := strings.Split(raw, ",")
+	roles := make([]string, 0, len(parts))
+	for _, p := range parts {
+		if t := strings.TrimSpace(p); t != "" {
+			roles = append(roles, t)
+		}
+	}
+	return roles
+}
+
+// checkModelAccess calls OPA's agent/models policy and returns (allowed, reason).
+// If OPA is unreachable the call fails open (allowed=true) with a warning logged.
+func checkModelAccess(ctx context.Context, opaURL, model string, roles []string) (bool, string) {
+	input := map[string]any{
+		"input": map[string]any{
+			"model": model,
+			"roles": roles,
+		},
+	}
+	body, _ := json.Marshal(input)
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost,
+		opaURL+"/v1/data/agent/models/allow", strings.NewReader(string(body)))
+	if err != nil {
+		logger.WarnCF("http_api", "OPA request build failed, failing open", map[string]any{"error": err})
+		return true, ""
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		logger.WarnCF("http_api", "OPA unreachable, failing open", map[string]any{"error": err})
+		return true, ""
+	}
+	defer resp.Body.Close()
+
+	var result struct {
+		Result bool `json:"result"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		logger.WarnCF("http_api", "OPA response parse failed, failing open", map[string]any{"error": err})
+		return true, ""
+	}
+
+	if !result.Result {
+		return false, "model access denied by policy"
+	}
+	return true, ""
 }

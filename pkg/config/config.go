@@ -512,10 +512,12 @@ type MaixCamSettings struct {
 // It exposes /agent, /agent.wait, /v1/chat/completions, and /v1/models
 // so that temporal-agent-worker and LibreChat can invoke agents over plain HTTP.
 type HTTPAPISettings struct {
-	Host           string       `json:"host"            yaml:"-" env:"PICOCLAW_CHANNELS_HTTP_API_HOST"`
-	Port           int          `json:"port"            yaml:"-" env:"PICOCLAW_CHANNELS_HTTP_API_PORT"`
-	Token          SecureString `json:"token,omitzero"  yaml:"token,omitempty" env:"PICOCLAW_CHANNELS_HTTP_API_TOKEN"`
-	MaxConnections int          `json:"max_connections" yaml:"-" env:"PICOCLAW_CHANNELS_HTTP_API_MAX_CONNECTIONS"`
+	Host            string       `json:"host"              yaml:"-" env:"PICOCLAW_CHANNELS_HTTP_API_HOST"`
+	Port            int          `json:"port"              yaml:"-" env:"PICOCLAW_CHANNELS_HTTP_API_PORT"`
+	Token           SecureString `json:"token,omitzero"    yaml:"token,omitempty" env:"PICOCLAW_CHANNELS_HTTP_API_TOKEN"`
+	MaxConnections  int          `json:"max_connections"   yaml:"-" env:"PICOCLAW_CHANNELS_HTTP_API_MAX_CONNECTIONS"`
+	ModelsSourceURL string       `json:"models_source_url" yaml:"-" env:"PICOCLAW_CHANNELS_HTTP_API_MODELS_SOURCE_URL"`
+	OpaURL          string       `json:"opa_url"           yaml:"-" env:"PICOCLAW_CHANNELS_HTTP_API_OPA_URL"`
 }
 
 type QQSettings struct {

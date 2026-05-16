@@ -19,7 +19,13 @@ func init() {
 			if !ok {
 				return nil, channels.ErrSendFailed
 			}
-			return NewHTTPAPIChannel(bc, c, b)
+			modelNames := make([]string, 0, len(cfg.ModelList))
+			for _, m := range cfg.ModelList {
+				if m.ModelName != "" {
+					modelNames = append(modelNames, m.ModelName)
+				}
+			}
+			return NewHTTPAPIChannel(bc, c, b, modelNames)
 		},
 	)
 }
