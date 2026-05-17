@@ -16,6 +16,14 @@ import (
 	"github.com/sipeed/picoclaw/pkg/fileutil"
 )
 
+// MemoryProvider is the interface ContextBuilder uses to fetch and watch memory.
+// *MemoryStore satisfies it by default; AxonMemoryProvider satisfies it for
+// Axon-backed long-term memory.
+type MemoryProvider interface {
+	GetMemoryContext() string
+	WatchedPaths() []string
+}
+
 // MemoryStore manages persistent memory for the agent.
 // - Long-term memory: memory/MEMORY.md
 // - Daily notes: memory/YYYYMM/YYYYMMDD.md
@@ -127,6 +135,12 @@ func (ms *MemoryStore) GetRecentDailyNotes(days int) string {
 	}
 
 	return sb.String()
+}
+
+// WatchedPaths returns the local files that, when changed, should trigger a
+// system-prompt cache invalidation. Satisfies MemoryProvider.
+func (ms *MemoryStore) WatchedPaths() []string {
+	return []string{ms.memoryFile}
 }
 
 // GetMemoryContext returns formatted memory context for the agent prompt.

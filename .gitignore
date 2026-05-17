@@ -73,3 +73,5 @@ web/backend/dist/*
 docker/data
 
 .omc/
+
+**/graphify-out

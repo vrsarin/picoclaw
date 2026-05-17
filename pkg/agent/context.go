@@ -24,7 +24,7 @@ import (
 type ContextBuilder struct {
 	workspace      string
 	skillsLoader   *skills.SkillsLoader
-	memory         *MemoryStore
+	memory         MemoryProvider
 	splitOnMarker  bool
 	agentDiscovery func(agentID string) []AgentDescriptor
 	promptRegistry *PromptRegistry
@@ -377,13 +377,22 @@ func (cb *ContextBuilder) InvalidateCache() {
 	logger.DebugCF("agent", "System prompt cache invalidated", nil)
 }
 
+// SetMemoryProvider replaces the memory backend and invalidates the cache.
+// Use this to swap in AxonMemoryProvider when Axon is configured.
+func (cb *ContextBuilder) SetMemoryProvider(p MemoryProvider) {
+	cb.memory = p
+	cb.InvalidateCache()
+}
+
 // sourcePaths returns non-skill workspace source files tracked for cache
 // invalidation (bootstrap files + memory). Skill roots are handled separately
 // because they require both directory-level and recursive file-level checks.
 func (cb *ContextBuilder) sourcePaths() []string {
 	agentDefinition := cb.LoadAgentDefinition()
 	paths := agentDefinition.trackedPaths(cb.workspace)
-	paths = append(paths, filepath.Join(cb.workspace, "memory", "MEMORY.md"))
+	if cb.memory != nil {
+		paths = append(paths, cb.memory.WatchedPaths()...)
+	}
 	return uniquePaths(paths)
 }
 
